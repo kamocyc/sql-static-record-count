@@ -1,0 +1,6 @@
+(executable
+ (public_name sqltest2)
+ (name main)
+ (libraries sqltest2)
+ (flags
+  (:standard -w -66-69-37-34-32)))
