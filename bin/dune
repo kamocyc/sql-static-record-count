@@ -3,4 +3,4 @@
  (name main)
  (libraries sqltest2)
  (flags
-  (:standard -w -66-69-37-34-32)))
+  (:standard -w -66-69-37-34-32-33-9-27-26)))
