@@ -63,10 +63,17 @@ module Schema = struct
     is_not_null : bool;
   }
 
+  type foreign_key = {
+    base_column_name : string;
+    reference_table_name: string;
+    reference_column_name: string;
+  }
+
   type table = {
     table_name : string;
     columns : column list;
     unique_keys : id list list;
+    foreign_keys: foreign_key list;
   }
 
   type t = { tables : table list }
@@ -234,15 +241,15 @@ module AstChecker = struct
     (* let result_table_id = generate_id () in *)
     let get_schema_column c =
       match List.filter
-            (fun (sc : Schema.column) -> sc.column_name = c || (String.starts_with ~prefix:"." c && String.ends_with ~suffix:c sc.column_name))
-            (schema_table.columns
-            @ (List.map
-                 (fun (t : 'a * Schema.table) -> (snd t).columns)
-                 join_schema_tables
-              |> List.flatten)) with
-          | [sc] -> sc
-          | [] -> failwith ("not found " ^ c)
-          | _ -> failwith ("multiple found " ^ c) in
+        (fun (sc : Schema.column) -> sc.column_name = c || (String.starts_with ~prefix:"." c && String.ends_with ~suffix:c sc.column_name))
+        (schema_table.columns
+        @ (List.map
+              (fun (t : 'a * Schema.table) -> (snd t).columns)
+              join_schema_tables
+          |> List.flatten)) with
+      | [sc] -> sc
+      | [] -> failwith ("not found " ^ c)
+      | _ -> failwith ("multiple found " ^ c) in
     let columns = List.map get_schema_column columns in
     let group_by = List.map get_schema_column group_by |> List.map (fun {Schema.column_name} -> column_name) in
     let unique_keys =
@@ -253,97 +260,20 @@ module AstChecker = struct
             unique_keys;
             [ group_by ];
           ] in
-      unique_keys |> remove_superset_keys
+      let unique_keys = unique_keys |> remove_superset_keys in
+      if List.length unique_keys = 0 then failwith "no unique key";
+      unique_keys
     in
+    let foreign_keys =
+      let all_foreign_keys = schema_table.foreign_keys @ (List.map (fun (_, t) -> t.Schema.foreign_keys) join_schema_tables |> List.flatten) in
+      List.filter (fun { Schema.base_column_name} -> List.exists (fun {Schema.column_name} -> base_column_name = column_name) columns) all_foreign_keys in
     {
       table_name = "";
       columns;
-      unique_keys = unique_keys
-        
+      unique_keys = unique_keys;
+      foreign_keys = foreign_keys
     }
 end
-(* 
-module IdentifierMap = struct
-  include Map.Make (String)
-
-  let find key map =
-    try find key map with Not_found -> failwith ("not found " ^ key)
-
-  let of_list ls =
-    List.fold_left
-      (fun map (k, v) -> add k v map)
-      empty
-      ls
-  
-  let to_list map =
-    fold (fun k v acc -> (k, v) :: acc) map []
-    |> List.rev
-  
-  (* keyは必ず.を含むとする *)
-  let find_one key map =
-    filter (fun k _ ->
-      k = key ||
-      String.ends_with ~suffix:key k
-    ) map
-    |> to_list
-    |> (function
-      | [] -> Either.Left "not found"
-      | [ (_, v) ] -> Right v
-      | _ -> Left ("not unique " ^ key))
-  
-  let find_one_exn key map =
-    match find_one key map with
-    | Right v -> v
-    | Left msg -> failwith msg
-end *)
-
-(* let to_ast_from_select (select: Parser.RawAst.select) (schema: Schema.t) =
-  let rec to_ast_from_table_like (name_id_map : id IdentifierMap.t) table_like =
-    match table_like with
-    | Parser.RawAst.Table name ->
-      let column_id_map =
-        let table = List.find (fun { Schema.table_name } -> table_name = name) schema.tables in
-        List.map (fun { Schema.column_name } -> table.table_name ^ "." ^ column_name) table.columns in
-      column_id_map, Ast.Table (IdentifierMap.find_one_exn ("." ^ name) table_id_map)
-    | SubQuery (select, alias) ->
-      let column_id_map, select = to_ast_from_select name_id_map select in
-      column_id_map, Ast.SubQuery (select, alias)
-  and to_ast_from_join name_id_map join =
-    let to_column_ids (columns: ((string * string) * (string * string)) list) =
-      List.map (fun ((table_name1, column_name1), (table_name2, column_name2)) -> IdentifierMap.find_one_exn (table_name1 ^ "." ^ column_name1) column_id_map, IdentifierMap.find_one_exn (table_name2 ^ "." ^ column_name2) column_id_map) columns
-    in
-    match join with
-    | Parser.RawAst.InnerJoin (table_like, columns) ->
-      let column_id_map, table_like = to_ast_from_table_like name_id_map table_like in
-      column_id_map, Ast.InnerJoin (table_like, to_column_ids columns)
-    | LeftOuterJoin (table_like, columns) ->
-      let column_id_map, table_like = to_ast_from_table_like name_id_map table_like in
-      column_id_map, LeftOuterJoin (table_like, to_column_ids columns)
-    | CrossJoin table_like ->
-      let column_id_map, table_like = to_ast_from_table_like name_id_map table_like in
-      column_id_map, CrossJoin (table_like)
-  and to_ast_from_select name_id_map select =
-    let (name_id_map', from) = to_ast_from_table_like name_id_map select.from in
-    let (name_id_maps, joins) = List.map (to_ast_from_join name_id_map) select.joins |> List.split in
-    let name_id_map = List.fold_left (fun acc map -> IdentifierMap.union (fun _ _ -> failwith "not unique") acc map) name_id_map (name_id_map'::name_id_maps) in
-    let columns = select.columns |> List.map (fun (c1, c2) -> IdentifierMap.find_one_exn (c1 ^ "." ^ c2) name_id_map) in
-    let group_by = select.group_by |> List.map (fun (c1, c2) -> IdentifierMap.find_one_exn (c1 ^ "." ^ c2) name_id_map) in
-    let returning_name_id_map =
-      select.columns |> List.map (fun (c1, c2) -> IdentifierMap.)
-    {
-      Ast.columns = columns;
-      from = from;
-      joins = joins;
-      group_by = group_by;
-    } in
-  let ast = to_ast_from_select table_id_map select in
-  let id_name_map =
-    IdentifierMap.to_list name_id_map
-    |> List.map (fun (k, v) -> (v, k))
-    |> List.to_seq
-    |> NameMap.of_seq in
-  ast, id_name_map *)
-
 
 let get_ast () =
   let schema : Schema.t =
@@ -371,6 +301,7 @@ let get_ast () =
                 };
               ];
             unique_keys = [ [ "order_id" ] ];
+            foreign_keys = [ { base_column_name = "customer_id"; reference_table_name = "customer"; reference_column_name = "customer_id" } ]
           };
           {
             table_name = "customer";
@@ -387,6 +318,7 @@ let get_ast () =
               }
             ];
             unique_keys = [ [ "customer_id" ] ];
+            foreign_keys = []
           }
         ];
     } in
@@ -397,7 +329,11 @@ let get_ast () =
       |> List.map (fun ({ Schema.table_name; columns } as ts) ->
         let columns = List.map (fun ( {Schema.column_name} as cs ) -> {cs with column_name = table_name ^ "." ^ column_name}) columns in
         let unique_keys = List.map (fun uk -> List.map (fun column_name -> table_name ^ "." ^ column_name) uk) ts.unique_keys in
-        {ts with columns; unique_keys}
+        if List.length unique_keys = 0 then failwith "no unique key";
+        let foreign_keys = List.map (fun {Schema.base_column_name; reference_table_name; reference_column_name} ->
+          {Schema.base_column_name = table_name ^ "." ^ base_column_name; reference_table_name = reference_table_name; reference_column_name = reference_table_name ^ "." ^ reference_column_name}
+        ) ts.foreign_keys in
+        {ts with columns; unique_keys; foreign_keys}
       ) in
     { Schema.tables } in
   let schema = preprocess_schema schema in

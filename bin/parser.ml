@@ -150,6 +150,7 @@ module RawAst = struct
   and join =
     InnerJoin of table_like * (id * id) list
     | LeftOuterJoin of table_like * (id * id) list
+    | RightOuterJoin of table_like * (id * id) list
     | CrossJoin of table_like
   and select = {
     columns : id list;
@@ -176,6 +177,10 @@ module RawAst = struct
           (columns |> List.split |> (fun (c1, c2) -> Printf.sprintf "%s" (show_columns c1) ^ Printf.sprintf "%s" (show_columns c2)))
     | LeftOuterJoin (table_like, columns) ->
         Printf.sprintf "LeftOuterJoin(%s, %s)"
+          (show_table_like table_like)
+          (columns |> List.split |> (fun (c1, c2) -> Printf.sprintf "%s" (show_columns c1) ^ Printf.sprintf "%s" (show_columns c2)))
+    | RightOuterJoin (table_like, columns) ->
+        Printf.sprintf "RightOuterJoin(%s, %s)"
           (show_table_like table_like)
           (columns |> List.split |> (fun (c1, c2) -> Printf.sprintf "%s" (show_columns c1) ^ Printf.sprintf "%s" (show_columns c2)))
     | CrossJoin table_like ->
@@ -316,6 +321,9 @@ module Parser = struct
     | LeftOuter ->
       let join_keys, lexer = get_join_keys lexer in
       (RawAst.LeftOuterJoin (table, join_keys), lexer)
+    | RightOuter ->
+      let join_keys, lexer = get_join_keys lexer in
+      (RawAst.RightOuterJoin (table, join_keys), lexer)
     | Cross ->
       (RawAst.CrossJoin table, lexer)
     | _ -> 
