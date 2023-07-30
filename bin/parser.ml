@@ -121,6 +121,7 @@ module Lexer = struct
             | "left" -> (Left, lexer)
             | "right" -> (Right, lexer)
             | "outer" -> (Outer, lexer)
+            | "cross" -> (Cross, lexer)
             | "on" -> (On, lexer)
             | "full" -> (Full, lexer)
             | "as" -> (As, lexer)
@@ -139,28 +140,28 @@ module Lexer = struct
     loop pos
 end
 
-type id = int
+type id = string
 
 module RawAst = struct
   type logical_operator = And | Or
   type value_operator = Eq
 
-  type table_like = Table of string | SubQuery of select * string
+  type table_like = Table of id | SubQuery of select * id
   and join =
-    InnerJoin of table_like * ((string * string) * (string * string)) list
-    | LeftOuterJoin of table_like * ((string * string) * (string * string)) list
+    InnerJoin of table_like * (id * id) list
+    | LeftOuterJoin of table_like * (id * id) list
     | CrossJoin of table_like
   and select = {
-    columns : (string * string) list;
+    columns : id list;
     from : table_like;
     joins : join list;
-    group_by : (string * string) list;
+    group_by : id list;
   }
   and logical_expr =
     LogicalOperator of logical_operator * logical_expr * logical_expr
   | ValueOperator of value_operator * value_expr * value_expr
   and value_expr =
-    Column of (string * string)
+    Column of id
 
   let rec show_table_like table_like =
     match table_like with
@@ -172,11 +173,11 @@ module RawAst = struct
     | InnerJoin (table_like, columns) ->
         Printf.sprintf "InnerJoin(%s, %s)"
           (show_table_like table_like)
-          (List.split columns |> (fun (columns1, columns2) -> show_columns columns1, show_columns columns2) |> (fun (s1, s2) -> Printf.sprintf "(%s, %s)" s1 s2))
+          (columns |> List.split |> (fun (c1, c2) -> Printf.sprintf "%s" (show_columns c1) ^ Printf.sprintf "%s" (show_columns c2)))
     | LeftOuterJoin (table_like, columns) ->
         Printf.sprintf "LeftOuterJoin(%s, %s)"
           (show_table_like table_like)
-          (List.split columns |> (fun (columns1, columns2) -> show_columns columns1, show_columns columns2) |> (fun (s1, s2) -> Printf.sprintf "(%s, %s)" s1 s2))
+          (columns |> List.split |> (fun (c1, c2) -> Printf.sprintf "%s" (show_columns c1) ^ Printf.sprintf "%s" (show_columns c2)))
     | CrossJoin table_like ->
         Printf.sprintf "CrossJoin(%s)"
           (show_table_like table_like)
@@ -191,7 +192,7 @@ module RawAst = struct
       (show_columns select.group_by)
   and show_columns columns =
     Printf.sprintf "[%s]"
-      (String.concat ", " (List.map (fun (column, alias) -> Printf.sprintf "(%s, %s)" column alias) columns))
+      (String.concat ", " (List.map (fun column -> Printf.sprintf "%s" column) columns))
 
 end
 
@@ -253,6 +254,8 @@ module Parser = struct
   
   type join_type = Inner | LeftOuter | RightOuter | FullOuter | Cross
 
+  let to_id (s1, s2) = s1 ^ "." ^ s2
+
   let rec table_like lexer =
     let s, lexer = Lexer.next lexer in
     match s with
@@ -279,7 +282,7 @@ module Parser = struct
     match op with
     | Lexer.Eq ->
       let ident2, lexer = prefixed_identifier lexer in
-      (RawAst.ValueOperator (RawAst.Eq, Column ident, Column ident2), lexer)
+      (RawAst.ValueOperator (RawAst.Eq, Column (to_id ident), Column (to_id ident2)), lexer)
     | _ ->
       raise (Invalid_argument "invalid boolean expression")
   and join_clause lexer =
@@ -296,18 +299,22 @@ module Parser = struct
     let join, lexer = Lexer.next lexer in
     equals join Lexer.Join;
     let table, lexer = table_like lexer in
-    let on, lexer = Lexer.next lexer in
-    equals on Lexer.On;
-    let expression, lexer = boolean_expression lexer in
-    let join_keys = match expression with
-      | RawAst.ValueOperator (RawAst.Eq, Column id1, Column id2) ->
-        [(id1, id2)]
-      | _ ->
-        failwith "invalid join keys" in
+    let get_join_keys lexer =
+      let on, lexer = Lexer.next lexer in
+      equals on Lexer.On;
+      let expression, lexer = boolean_expression lexer in
+      let join_keys = match expression with
+        | RawAst.ValueOperator (RawAst.Eq, Column id1, Column id2) ->
+          [(id1, id2)]
+        | _ ->
+          failwith "invalid join keys" in
+      join_keys, lexer in
     match join_type with
     | Inner ->
+      let join_keys, lexer = get_join_keys lexer in
       (RawAst.InnerJoin (table, join_keys), lexer)
     | LeftOuter ->
+      let join_keys, lexer = get_join_keys lexer in
       (RawAst.LeftOuterJoin (table, join_keys), lexer)
     | Cross ->
       (RawAst.CrossJoin table, lexer)
@@ -341,9 +348,9 @@ module Parser = struct
       | Invalid_argument _ ->
         [], lexer in
     {
-      RawAst.columns = select_columns;
+      RawAst.columns = select_columns |> List.map to_id;
       RawAst.from = table;
       RawAst.joins = joins;
-      RawAst.group_by = group_by_columns;
+      RawAst.group_by = group_by_columns |> List.map to_id;
     }, lexer
 end

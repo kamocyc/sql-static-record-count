@@ -1,0 +1,48 @@
+// https://ronsavage.github.io/SQL/sql-92.bnf.html#search%20condition
+
+// subset
+query_specification ::= "SELECT" select_list "FROM" table_reference group_by_clause
+select_list ::=
+  column_reference
+  | column_reference "," select_list
+
+
+
+/* 
+// full
+query_specification ::= "SELECT" set_quantifier? select_list table_expression
+set_quantifier ::= "ALL" | "DISTINCT"
+select_list ::= "*" | <select_sublist> ["," <select_sublist>]*
+<select_sublist> ::= <value_expression> [ [ "AS" ] <alias> ]
+table_expression ::= <from_clause> [ <where_clause> ] [ <group_by_clause> ]
+from_clause ::= "FROM" <table_reference> ["," <table_reference>]*
+<where_clause> ::= "WHERE" <search_condition>
+<group_by_clause> ::= "GROUP BY" <column_reference> ["," <column_reference>]*
+<column_reference> ::= <table_name> "." <column_name>
+<value_expression> ::= <column_reference> | <constant>
+<constant> ::= <string_literal> | <signed_number>
+<signed_number> ::= [ "+" | "-" ] <number>
+<search_condition> ::= <boolean_term> [ "OR" <boolean_term> ]*
+<boolean_term> ::= <boolean_factor> [ "AND" <boolean_factor> ]*
+<boolean_factor> ::= [ "NOT" ] <boolean_primary>
+<boolean_primary> ::= <predicate> | <boolean_value_expression>
+<boolean_value_expression> ::= <boolean_term> | <boolean_factor> | <boolean_primary>
+<predicate> ::= <comparison_predicate> | <null_predicate>
+<comparison_predicate> ::= <row_value_constructor> <comp_op> <row_value_constructor>
+<row_value_constructor> ::= <value_expression>
+<comp_op> ::= "=" | "<" | ">" | "<=" | ">=" | "<>"
+<null_predicate> ::= <row_value_constructor> "IS" [ "NOT" ] "NULL"
+<alias> ::= <identifier>
+<identifier> ::= <identifier_start_character> [ <identifier_part_character> ]*
+<identifier_start_character> ::= <letter> | "_"
+<identifier_part_character> ::= <identifier_start_character> | <decimal_digit>
+<string_literal> ::= "'" <character_representation> "'"
+*/
+
+/*
+何をわかりたいか。
+カラムの型
+行数（制約に由来）
+特定の列の値（whereやjoinに由来）
+nullability
+*/
