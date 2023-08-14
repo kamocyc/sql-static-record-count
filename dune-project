@@ -1,5 +1,5 @@
 (lang dune 3.9)
-
+(using menhir 2.1)
 (name sqltest2)
 
 (generate_opam_files true)

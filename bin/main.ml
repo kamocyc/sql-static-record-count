@@ -5,54 +5,22 @@ let list_equals list1 list2 =
   let list2 = List.sort_uniq String.compare list2 in
   list1 = list2
 
-  module NameMap = Map.Make (String)
+module NameMap = Map.Make (String)
 
-  (* module Ast = struct
-    type table_like = Table of id | SubQuery of select * string
-  
-    and join =
-      | InnerJoin of table_like * (id * id) list
-      | LeftOuterJoin of table_like * (id * id) list
-      | CrossJoin of table_like
-  
-    and select = {
-      columns : id list;
-      from : table_like;
-      joins : join list;
-      group_by : id list (* where: where; *);
-    }
-  
-    type t = Select of select
-  
-    let show_column column name_map =
-      let open Printf in
-      sprintf "%s" (NameMap.find column name_map)
-  
-    let rec show_from from name_map =
-      let open Printf in
-      match from with
-      | Table table -> sprintf "%s" (NameMap.find table name_map)
-      | SubQuery (select, alias) ->
-          sprintf "(%s) as %s" (show_ast (Select select) name_map) alias
-  
-    and show_group_by group_by name_map =
-      let open Printf in
-      if List.length group_by > 0 then
-        let group_by = List.map (fun c -> show_column c name_map) group_by in
-        String.concat ", " group_by
-      else ""
-  
-    and show_ast ast name_map =
-      let open Printf in
-      match ast with
-      | Select { columns; from; group_by } ->
-          let columns = List.map (fun c -> show_column c name_map) columns in
-          let columns = String.concat ", " columns in
-          sprintf "SELECT %s FROM %s %s" columns (show_from from name_map)
-            (show_group_by group_by name_map)
-  end *)
+module List = struct
+  include List
 
-module Ast = Parser.RawAst
+  let find p ls msg =
+    match filter p ls with
+    | x::_ -> x
+    | _ -> failwith ("find: " ^ msg)
+
+  let find_one p ls msg =
+    match filter p ls with
+    | [x] -> x
+    | [] -> failwith ("find_one (NO MATCH): " ^ msg)
+    | _ -> failwith ("find_one (MULTIPLE MATCH): " ^ msg)
+end
 
 module Schema = struct
   type column_type = CInt | CNVarchar
@@ -60,7 +28,7 @@ module Schema = struct
   type column = {
     column_name : string;
     column_type : column_type;
-    is_not_null : bool;
+    is_nullable : bool;
   }
 
   type foreign_key = {
@@ -72,7 +40,7 @@ module Schema = struct
   type table = {
     table_name : string;
     columns : column list;
-    unique_keys : id list list;
+    unique_keys : id list list option;
     foreign_keys: foreign_key list;
   }
 
@@ -80,8 +48,9 @@ module Schema = struct
 
   let show_column column =
     let open Printf in
-    sprintf "%s: %s" column.column_name
+    sprintf "%s: %s(%s)" column.column_name
       (match column.column_type with CInt -> "int" | CNVarchar -> "varchar")
+      (match column.is_nullable with false -> "not_null" | true -> "nullable")
   
   let show_table table =
     let open Printf in
@@ -89,12 +58,15 @@ module Schema = struct
       List.map (fun c -> show_column c) table.columns |> String.concat ", "
     in
     let unique_keys =
-      List.map
-        (fun uk -> "(" ^ String.concat ", " (uk) ^ ")")
-        table.unique_keys
-      |> String.concat ", "
+      match table.unique_keys with
+      | None -> "None"
+      | Some unique_keys ->
+        List.map
+          (fun uk -> "(" ^ String.concat ", " (uk) ^ ")")
+          unique_keys
+        |> String.concat ", "
     in
-    sprintf "%s: (%s), unique_keys: (%s)" table.table_name columns unique_keys
+    sprintf "%scolumns: (%s), unique_keys: (%s)" (if table.table_name = "" then "" else table.table_name ^ ": ") columns unique_keys
 
   let show_schema schema =
     let tables = List.map (fun t -> show_table t) schema.tables in
@@ -103,7 +75,6 @@ module Schema = struct
 end
 
 module AstChecker = struct
-  
   let remove_superset_keys unique_keys_ =
     (* ks2 >= ks1 *)
     let is_superset ks1 ks2 =
@@ -119,85 +90,115 @@ module AstChecker = struct
     in
     sub unique_keys_ []
 
+  let rec to_column_list (expr : Ast.logical_expr) =
+    match expr with
+    | ValueOperator (Eq, ValueColumn c1, ValueColumn c2) ->
+      [(c1, c2)]
+    | LogicalOperator (And, e1, e2) ->
+      to_column_list e1 @ to_column_list e2
+
+  let calc_unique_keys schema_table join_schema_tables schema_column_names joins =
+    if schema_table.Schema.unique_keys = None || List.exists (fun (_, t) -> t.Schema.unique_keys = None) join_schema_tables then
+      None
+    else begin
+      let unique_keys =
+        (* joinテーブルのukを結合して、最大の集合を作る *)
+        let unique_keys =
+          let rec sub acc (unique_keys : id list list list) =
+            match unique_keys with
+            | [] -> acc
+            | x :: xs ->
+                let acc =
+                  List.map
+                    (fun uk -> List.map (fun uk' -> uk @ uk') x)
+                    acc
+                  |> List.flatten
+                in
+                sub acc xs
+              in
+          sub (Option.get schema_table.Schema.unique_keys) (List.map (fun (_, t) -> (Option.get t.Schema.unique_keys)) join_schema_tables) in
+        let dependencies =
+          (List.map (fun uk -> List.map (fun k -> (uk, k)) schema_column_names) (Option.get schema_table.unique_keys)
+          @
+          (List.map (fun (_, t) -> List.map (fun uk -> List.map (fun k -> (uk, k)) (List.map (fun c -> c.Schema.column_name) t.Schema.columns)) (Option.get t.Schema.unique_keys)) join_schema_tables
+          |> List.flatten)
+          @
+          (List.map (fun join ->
+            match join with
+            | Ast.InnerJoin (_, cs) -> cs |> to_column_list |> List.map (fun (c1, c2) -> [([c1], c2); ([c2], c1)]) |> List.flatten
+            | Ast.LeftOuterJoin (_, cs) -> cs |> to_column_list |> List.map (fun (c1, c2) ->
+              if String.starts_with ~prefix:(schema_table.Schema.table_name ^ ".") c1 then
+                [([c1], c2)]
+              else
+                [([c2], c1)]
+            )|> List.flatten
+            | Ast.RightOuterJoin (_, cs) -> cs |> to_column_list |> List.map (fun (c1, c2) -> 
+              if String.starts_with ~prefix:(schema_table.Schema.table_name ^ ".") c1 then
+                [([c2], c1)]
+              else
+                [([c1], c2)]) |> List.flatten
+            | Ast.CrossJoin _ -> []
+            ) joins))
+          |> List.flatten
+        in
+        let dependencies =
+          List.filter (fun (fs, t) -> not @@ List.exists (fun f -> f = t) fs) dependencies
+        in
+        print_endline @@ "dependencies: " ^ (dependencies |> List.map (fun (fs, t) -> "(" ^ (String.concat ", " fs) ^ ") -> " ^ t) |> String.concat ", ");
+        let unique_keys =
+          List.map
+            (fun uk ->
+              let rec sub uk =
+                let r =
+                  List.fold_left
+                    (fun uk (fs, t) ->
+                      List.map (fun k -> if k = t then fs else [k]) uk
+                      |> List.flatten
+                    )
+                    uk
+                    dependencies
+                  |> List.sort_uniq compare in
+                if list_equals r uk then r else sub r
+              in
+              sub uk
+            )
+            unique_keys in
+        let unique_keys =
+          remove_superset_keys unique_keys in
+        unique_keys
+      in
+      Some unique_keys
+    end
+    
+  let get_alias_name c =
+    match c with
+    | Ast.ColumnAlias (_, alias) -> alias
+    | Ast.Column c -> c
+    | Ast.AggFunc (_, alias) -> alias
+    
   let rec get_from (from : Ast.table_like) (schema : Schema.t) =
     match from with
     | Ast.Table table ->
-        let schema_table : Schema.table option =
-          List.find_opt
+        let schema_table =
+          List.find
             (fun (t : Schema.table) -> t.table_name = table)
             schema.tables
-        in
-        let schema_table =
-          match schema_table with
-          | None ->
-              failwith
-              @@ Printf.sprintf "Table not found: %s"
-              @@ table
-          | Some schema_table -> schema_table
-        in
+            (Printf.sprintf "Table not found: %s" table) in
         schema_table
     | Ast.SubQuery (query, name) ->
         let sub_table = check_select query schema in
-        { sub_table with table_name = name }
-
-  and calculate_unique_keys (schema_table : Schema.table)
-      (join_schema_tables : (Ast.join * Schema.table) list) =
-    let rec sub unique_keys join_schema_tables =
-      match join_schema_tables with
-      | (join, table_schema) :: xs -> (
-          match join with
-          | Ast.CrossJoin _ ->
-              let schema_unique_keys = table_schema.Schema.unique_keys in
-              let result =
-                List.map
-                  (fun uk -> List.map (fun uk' -> uk @ uk') schema_unique_keys)
-                  unique_keys
-                |> List.flatten
-              in
-              sub result xs
-          | Ast.InnerJoin (_, join_columns) ->
-              let schema_unique_keys = table_schema.Schema.unique_keys in
-              let left_columns, right_columns = List.split join_columns in
-              (* left_columnsが左のテーブルのunique_keysのいずれかと一致するか *)
-              let is_unique_key_in_left =
-                List.exists
-                  (fun (uk : id list) -> list_equals uk left_columns)
-                  unique_keys
-              in
-              (* right_columnsが右のテーブルのunique_keysのいずれかと一致するか *)
-              let is_unique_key_in_right =
-                List.exists
-                  (fun (uk : id list) -> list_equals uk right_columns)
-                  schema_unique_keys
-              in
-              let new_unique_keys =
-                if is_unique_key_in_left && is_unique_key_in_right then
-                  (* 1:1結合なので、右側のunique_keysもuniqueになる *)
-                  unique_keys @ schema_unique_keys
-                else if is_unique_key_in_left then
-                  (* 右側のテーブル以上はレコードは増えないので、右側のunique_keysを採用 *)
-                  schema_unique_keys
-                else if is_unique_key_in_right then
-                  (* 左側のテーブル以上はレコードは増えないので、左側のunique_keysを採用 *)
-                  unique_keys
-                else
-                  (* どちらもunique_keysではないので、組み合わせ *)
-                  List.map
-                    (fun uk ->
-                      List.map (fun uk' -> uk @ uk') schema_unique_keys)
-                    unique_keys
-                  |> List.flatten
-              in
-              sub new_unique_keys xs
-          (* left outer joinの判定は、外部キー制約の情報が必要 *)
-          | Ast.LeftOuterJoin (_, join_columns) -> failwith "not implemented")
-      | [] -> unique_keys
-    in
-    sub schema_table.unique_keys join_schema_tables |> remove_superset_keys
-
+        let columns = List.map (fun column ->
+          let column_name =
+            match String.split_on_char '.' column.Schema.column_name with
+            | [table; column] -> name ^ "." ^ column
+            | _ -> name ^ "." ^ column.Schema.column_name in
+          { column with Schema.column_name = column_name }
+        ) sub_table.columns in
+        { sub_table with table_name = name; columns = columns }
   and check_select (select : Ast.select) (schema : Schema.t) : Schema.table =
     let ({ from; columns; joins; group_by } : Ast.select) = select in
     let schema_table = get_from from schema in
+    let schema_column_names = schema_table.columns |> List.map (fun c -> c.Schema.column_name) in
     let join_schema_tables =
       List.map
         (fun (j : Ast.join) ->
@@ -205,68 +206,147 @@ module AstChecker = struct
             match j with
             | InnerJoin (t, _) -> t
             | LeftOuterJoin (t, _) -> t
+            | RightOuterJoin (t, _) -> t
             | CrossJoin t -> t
           in
           (j, get_from t schema))
         joins
     in
-    (* let ast_columns =
-         List.map (fun (c : Ast.column) -> c.column_id) columns
-         |> List.sort_uniq Int.compare
-       in
-       let schema_columns =
-         List.sort_uniq Int.compare
-         @@ List.map (fun (c : Schema.column) -> c.column_id) schema_table.columns
-       in
-       (* columnsの中にschema_columnsにないものがある *)
-       (* TODO: joinの分 *)
-       let diff =
-         List.filter (fun c -> not @@ List.mem c schema_columns) ast_columns
-       in
-       if diff <> [] then
-         failwith
-         @@ Printf.sprintf "Column not found: %s"
-         @@ String.concat ", " (List.map string_of_int diff);
-       (* group_byカラムの中にschema_columnsにないものがある *)
-       let ast_group_by =
-         List.map (fun (c : Ast.column) -> c.column_id) group_by
-       in
-       let diff =
-         List.filter (fun c -> not @@ List.mem c schema_columns) ast_group_by
-       in
-       if diff <> [] then
-         failwith
-         @@ Printf.sprintf "Column not found: %s"
-         @@ String.concat ", " (List.map string_of_int diff); *)
-    (* let result_table_id = generate_id () in *)
     let get_schema_column c =
       match List.filter
-        (fun (sc : Schema.column) -> sc.column_name = c || (String.starts_with ~prefix:"." c && String.ends_with ~suffix:c sc.column_name))
+        (fun (sc : Schema.column) -> sc.column_name = c (* || (String.starts_with ~prefix:"." c && String.ends_with ~suffix:c sc.column_name) *))
         (schema_table.columns
         @ (List.map
               (fun (t : 'a * Schema.table) -> (snd t).columns)
               join_schema_tables
           |> List.flatten)) with
       | [sc] -> sc
-      | [] -> failwith ("not found " ^ c)
+      | [] -> failwith ("(get_schema_column) not found " ^ c)
       | _ -> failwith ("multiple found " ^ c) in
-    let columns = List.map get_schema_column columns in
-    let group_by = List.map get_schema_column group_by |> List.map (fun {Schema.column_name} -> column_name) in
-    let unique_keys =
-      let unique_keys = calculate_unique_keys schema_table join_schema_tables in
-      let unique_keys =
-        List.concat
-          [
-            unique_keys;
-            [ group_by ];
-          ] in
-      let unique_keys = unique_keys |> remove_superset_keys in
-      if List.length unique_keys = 0 then failwith "no unique key";
-      unique_keys
+    let get_occuring_columns column_like =
+      match column_like with
+      | Ast.Column c -> [c]
+      | Ast.AggFunc (aggFunc, _) -> begin
+        match aggFunc with
+        | Count c -> [c]
+        | Sum c -> [c]
+        | Avg c -> [c]
+        | Min c -> [c]
+        | Max c -> [c]
+      end
+      | Ast.ColumnAlias (c, _) -> [c]
     in
+    let columns = columns |> List.map get_occuring_columns |> List.flatten |> List.map get_schema_column in
+    let group_by = List.map get_schema_column group_by |> List.map (fun {Schema.column_name} -> column_name) in
+    
     let foreign_keys =
       let all_foreign_keys = schema_table.foreign_keys @ (List.map (fun (_, t) -> t.Schema.foreign_keys) join_schema_tables |> List.flatten) in
       List.filter (fun { Schema.base_column_name} -> List.exists (fun {Schema.column_name} -> base_column_name = column_name) columns) all_foreign_keys in
+    let can_be_considerred_as_inner_join (base_table_schema: Schema.table) (join_table: Schema.table) (join_columns: (id * id) list) =
+      let foreign_keys = base_table_schema.foreign_keys in
+      let base_table_columns = base_table_schema.columns in
+      List.for_all (fun join_column ->
+        List.exists (fun { Schema.reference_table_name; reference_column_name; base_column_name } ->
+          let (column1, column2) = join_column in
+          let base_table_column = List.find (fun c -> c.Schema.column_name = base_column_name) base_table_columns "" in
+          not base_table_column.is_nullable &&
+            join_table.Schema.table_name = reference_table_name &&
+            ((column1 = reference_column_name && column2 = base_column_name) || (column2 = reference_column_name && column1 = base_column_name))
+          )
+          foreign_keys
+      )
+      join_columns
+    in
+    let unique_keys = calc_unique_keys schema_table join_schema_tables schema_column_names joins in
+    let unique_keys =
+      match unique_keys with
+      | Some unique_keys ->
+        let unique_keys =
+          if List.length group_by = 0 then begin
+            if List.exists (fun c -> match c with Ast.AggFunc _ -> true | _ -> false) select.columns then
+              (* group by 指定なしの集約関数により、単一の値にまとめられた *)
+              []
+            else
+              unique_keys
+          end else
+          List.concat
+            [
+              unique_keys;
+              [ group_by ];
+            ] in
+        let unique_keys = unique_keys |> remove_superset_keys in
+        if List.length unique_keys = 0 then failwith "no unique key";
+        Some unique_keys
+      | None ->
+        if List.length group_by = 0 then begin
+          if List.exists (fun c -> match c with Ast.AggFunc _ -> true | _ -> false) select.columns then
+            (* group by 指定なしの集約関数により、単一の値にまとめられた *)
+            Some []
+          else
+            None
+        end else
+          Some [ group_by ]
+    in
+    let unique_keys =
+      match unique_keys with
+      | Some unique_keys ->
+        (* selectで指定されたカラムのみを含むkeysのみ残す => このときに消えた場合はどうするか => それ以降の外側のテーブルはキーが存在しない *)
+        let unique_keys = List.filter (fun keys ->
+          List.for_all (fun k ->
+            List.exists (fun c -> get_alias_name c = k) select.columns
+          ) keys
+        ) unique_keys in
+        List.iter (fun keys ->
+          print_endline @@ "unique_keys: " ^ (String.concat ", " keys)
+        ) unique_keys;
+        if List.length unique_keys = 0 then None else Some unique_keys
+      | None -> None
+    in
+    let columns =
+      (* nullability *)
+      let rec sub nullables (joins: (Ast.join * Schema.table) list) =
+        match joins with
+        | [] -> nullables
+        | (join, s)::xs -> begin
+          match join with
+          | Ast.InnerJoin (t, columns) ->
+            (* nullの追加はなし *)
+            sub ((s, (Some join, false))::nullables) xs
+          | CrossJoin t ->
+            (* nullの追加は無し *)
+            sub ((s, (Some join, false))::nullables) xs
+          | LeftOuterJoin (t, columns) ->
+            let b = can_be_considerred_as_inner_join schema_table s (to_column_list columns) in
+            (* 基本は左にnullを追加 *)
+            sub ((s, (Some join, not b))::nullables) xs
+          | RightOuterJoin (t, columns) ->
+            let b = can_be_considerred_as_inner_join schema_table s (to_column_list columns) in
+            (* 基本は右にnullを追加 *)
+            let nullables = List.map (fun (s, (j, _)) -> (s, (j, not b))) nullables in
+            sub ((s, (Some join, false))::nullables) xs
+        end
+      in
+      let nullables = sub [(schema_table, (None, false))] join_schema_tables in
+      List.map
+        (fun column ->
+          let table_name =
+            match String.split_on_char '.' column.Schema.column_name with
+            | [t; _] -> t
+            | _ -> failwith (column.Schema.column_name) in
+          let nullable = List.find_one (fun (s, _) -> s.Schema.table_name = table_name) nullables table_name in
+          { column with is_nullable = column.is_nullable || (snd @@ snd nullable) }
+        )
+        columns
+    in
+    let columns =
+      List.mapi (fun i c ->
+        let original_column = List.nth select.columns i in
+        match original_column with
+        | Ast.Column (_) -> c
+        | Ast.ColumnAlias (_, alias) -> { c with Schema.column_name = alias }
+        | Ast.AggFunc (_, alias) -> { c with column_name = alias }
+        )
+        columns in
     {
       table_name = "";
       columns;
@@ -275,7 +355,7 @@ module AstChecker = struct
     }
 end
 
-let get_ast () =
+let get_schema () =
   let schema : Schema.t =
     {
       tables =
@@ -287,20 +367,20 @@ let get_ast () =
                 {
                   column_name = "order_id";
                   column_type = CInt;
-                  is_not_null = true;
+                  is_nullable = false;
                 };
                 {
                   column_name = "customer_id";
                   column_type = CInt;
-                  is_not_null = true;
+                  is_nullable = false;
                 };
                 {
                   column_name = "order_name";
                   column_type = CNVarchar;
-                  is_not_null = false;
+                  is_nullable = true;
                 };
               ];
-            unique_keys = [ [ "order_id" ] ];
+            unique_keys = Some [ [ "order_id" ] ];
             foreign_keys = [ { base_column_name = "customer_id"; reference_table_name = "customer"; reference_column_name = "customer_id" } ]
           };
           {
@@ -309,15 +389,15 @@ let get_ast () =
               {
                 column_name = "customer_id";
                 column_type = CInt;
-                is_not_null = true;
+                is_nullable = false;
               };
               {
                 column_name = "customer_name";
                 column_type = CNVarchar;
-                is_not_null = true;
+                is_nullable = false;
               }
             ];
-            unique_keys = [ [ "customer_id" ] ];
+            unique_keys = Some [ [ "customer_id" ] ];
             foreign_keys = []
           }
         ];
@@ -328,8 +408,14 @@ let get_ast () =
       tables
       |> List.map (fun ({ Schema.table_name; columns } as ts) ->
         let columns = List.map (fun ( {Schema.column_name} as cs ) -> {cs with column_name = table_name ^ "." ^ column_name}) columns in
-        let unique_keys = List.map (fun uk -> List.map (fun column_name -> table_name ^ "." ^ column_name) uk) ts.unique_keys in
-        if List.length unique_keys = 0 then failwith "no unique key";
+        let unique_keys =
+          match ts.unique_keys with
+          | Some unique_keys -> begin
+            let unique_keys = List.map (fun uk -> List.map (fun column_name -> table_name ^ "." ^ column_name) uk) unique_keys in
+            if List.length unique_keys = 0 then failwith "no unique key";
+            Some unique_keys
+          end
+          | None -> None in
         let foreign_keys = List.map (fun {Schema.base_column_name; reference_table_name; reference_column_name} ->
           {Schema.base_column_name = table_name ^ "." ^ base_column_name; reference_table_name = reference_table_name; reference_column_name = reference_table_name ^ "." ^ reference_column_name}
         ) ts.foreign_keys in
@@ -338,35 +424,161 @@ let get_ast () =
     { Schema.tables } in
   let schema = preprocess_schema schema in
   schema
-  (* let ast =
-    Ast.Select
-      {
-        columns = [ { column_id = 1; column_name = "order_id" }; { column_id = 2; column_name = "customer_id" }; { column_id = 6; column_name = "customer_name"} ];
-        from = Table { table_id = 10; table_name = "order" };
-        joins = [ Ast.InnerJoin (Table { table_id = 11; table_name = "customer" }, [ { column_id = 2; column_name = "customer_id" }, { column_id = 5; column_name = "customer_id" } ]) ];
-        group_by = [ { column_id = 2; column_name = "customer_id" } ];
-      }
+
+type simple_table_like = {
+  columns: id list;
+  name: string;
+}
+
+let rec get_table_like_schema (from : Ast.table_like) =
+  match from with
+  | Table id ->
+    let schema = get_schema () in
+    let table = List.find (fun t -> t.Schema.table_name = id) schema.Schema.tables "not found table" in
+    (* print_endline @@ "columns = " ^ (table.Schema.columns |> List.map (fun c -> c.Schema.column_name) |> String.concat ", "); *)
+    {
+      columns = table.Schema.columns |> List.map (fun c -> c.Schema.column_name);
+      name = id;
+    }
+  | SubQuery (ast, id) ->
+    let schema = get_query ast in
+    {
+      columns = schema.columns |> List.map (fun c ->
+        match String.split_on_char '.' c with
+        | [t; c] -> id ^ "." ^ c
+        | _ -> id ^ "." ^ c)
+      ;
+      name = id;
+    }
+
+and get_query (ast : Ast.select) =
+  let { Ast.columns; from; joins; group_by } = ast in
+  let get_alias_name c =
+    match c with
+    | Ast.ColumnAlias (_, alias) -> alias
+    | Ast.Column c -> c
+    | Ast.AggFunc (_, alias) -> alias in
+  {
+    columns = columns |> List.map get_alias_name;
+    name = "";
+  }
+
+let get_table_like_name (table_like : Ast.table_like) =
+  match table_like with
+  | Table id -> id
+  | SubQuery (_, id) -> id
+
+let has_duplicates xs =
+  let rec sub xs =
+    match xs with
+    | [] -> false
+    | x::xs ->
+      if List.exists (fun y -> x = y) xs then true
+      else sub xs
   in
-  print_endline @@ Ast.show_ast ast;
-  print_endline @@ Schema.show_schema schema;
-  let result = AstCheker.check_ast ast schema in
-  print_endline @@ Schema.show_schema { tables = [ result ] }
-*)
-let () =
-  (* let lexer = Parser.Lexer.init "SELECT A, piyo FROM users INNER JOIN (SELECT neko FROM fuga) AS sections ON sections.section_id = users.section_id2 GROUP BY hoge, fuga" in *)
-  let lexer = Parser.Lexer.init "SELECT order_id, order.customer_id, customer_name FROM order CROSS JOIN customer GROUP BY order_id" in
-  let (select, lexer) = Parser.Parser.query_specification lexer in
-  print_endline @@ Parser.RawAst.show_select select;
-  if lexer.pos >= lexer.len then begin
-    let schema = get_ast () in
-    let result = AstChecker.check_select select schema in
-    print_endline @@ Schema.show_schema { tables = [ result ] };
-    (* let ast, name_map = to_ast_from_select select schema in *)
-    (* print_endline @@ Ast.show_ast (Ast.Select ast) name_map; *)
-    print_endline "EOF"
-  end else
-    begin
-      print_endline @@ "pos: " ^ (string_of_int lexer.pos);
-      print_endline @@ "len: " ^ (string_of_int lexer.len);
-      print_endline @@ "not EOF: " ^ (String.sub lexer.str lexer.pos (lexer.len - lexer.pos))
+  sub xs
+
+let rec to_fqn_table_like table_like = 
+  match table_like with
+  | Ast.Table id -> Ast.Table id
+  | Ast.SubQuery (ast, id) -> Ast.SubQuery (to_fqn ast, id)
+and to_fqn (ast : Ast.select) =
+  let { Ast.columns; from; joins; group_by } = ast in
+  let from = to_fqn_table_like from in
+  let joins = List.map (fun (join) ->
+    match join with
+    | Ast.InnerJoin (table_like, expr) -> Ast.InnerJoin (to_fqn_table_like table_like, expr)
+    | Ast.LeftOuterJoin (table_like, expr) -> Ast.LeftOuterJoin (to_fqn_table_like table_like, expr)
+    | Ast.RightOuterJoin (table_like, expr) -> Ast.RightOuterJoin (to_fqn_table_like table_like, expr)
+    | Ast.CrossJoin (table_like) -> Ast.CrossJoin (to_fqn_table_like table_like)
+  ) joins in
+  let from_schema = get_table_like_schema from in
+  let join_schemas = List.map (fun (join) ->
+    match join with
+    | Ast.InnerJoin (table_like, _) -> get_table_like_schema table_like
+    | Ast.LeftOuterJoin (table_like, _) -> get_table_like_schema table_like
+    | Ast.RightOuterJoin (table_like, _) -> get_table_like_schema table_like
+    | Ast.CrossJoin (table_like) -> get_table_like_schema table_like
+  ) joins in
+  let schemas = from_schema::join_schemas in
+  List.iter (fun { columns } ->
+    if columns |> has_duplicates then failwith "duplicate column name"
+  ) schemas;
+  if schemas |> List.map (fun {name} -> name) |> has_duplicates then failwith "duplicate table name";
+  (* print_endline @@ "columns " ^ (columns |> List.map (fun column ->
+    match column with
+    | Ast.Column c -> c
+    | Ast.ColumnAlias (_, alias) -> alias
+    | Ast.AggFunc (_, alias) -> alias
+  ) |> String.concat ", ");
+  print_endline @@ "schemas: " ^ (schemas |> List.map (fun {name} -> name) |> String.concat ", "); *)
+  let get_fqn target_name =
+    if String.index_opt target_name '.' <> None then target_name
+    else begin
+      let x = List.find_one (fun { columns; name } ->
+        (* print_endline @@ "columns: " ^ (columns |> String.concat ", "); *)
+        List.exists (fun column_name -> (List.nth (String.split_on_char '.' column_name) 1) = target_name) columns
+      ) schemas ("get_fqn (" ^ target_name ^ ")") in
+      x.name ^ "." ^ target_name
+    end in
+  let columns = List.map (fun column ->
+    match column with
+    | Ast.Column c -> Ast.Column (get_fqn c)
+    | Ast.ColumnAlias (c, alias) -> Ast.ColumnAlias (get_fqn c, alias)
+    | Ast.AggFunc (agg_func, alias) -> begin
+      match agg_func with
+      | Ast.Count c -> Ast.AggFunc (Ast.Count (get_fqn c), alias)
+      | Ast.Sum c -> Ast.AggFunc (Ast.Sum (get_fqn c), alias)
+      | Ast.Avg c -> Ast.AggFunc (Ast.Avg (get_fqn c), alias)
+      | Ast.Max c -> Ast.AggFunc (Ast.Max (get_fqn c), alias)
+      | Ast.Min c -> Ast.AggFunc (Ast.Min (get_fqn c), alias)
     end
+  ) columns in
+  let group_by = List.map get_fqn group_by in
+  (* TODO: joinの対応 *)
+  { Ast.columns; from; joins; group_by }
+
+let process_sql sql =
+  let sql = "
+SELECT
+  order_id,
+  order.customer_id,
+  customer.customer_id,
+  customer_name
+FROM
+  order
+LEFT OUTER JOIN
+  customer
+    ON order.customer_id = customer.customer_id
+GROUP BY customer_name" in
+  let sql = "
+SELECT
+  customer_id,
+  ct
+FROM (
+  SELECT
+    customer_id,
+    COUNT(order_id) AS ct
+  FROM
+    order
+  GROUP BY
+    customer_id
+) AS t
+  " in
+  let lexbuf = Lexing.from_string sql in
+  let ast = Parser.prog Lexer.read lexbuf in
+  let ast = to_fqn ast in
+  print_endline @@ Ast.show_select ast;
+  
+  let schema = get_schema () in
+  let result = AstChecker.check_select ast schema in
+  print_endline @@ "result table: " ^ Schema.show_schema { tables = [ result ] };
+  Schema.show_schema { tables = [ result ] }
+  
+open Js_of_ocaml
+
+let _ =
+  Js.export "myLib"
+    (object%js
+        method process_sql sql = process_sql sql
+      end)

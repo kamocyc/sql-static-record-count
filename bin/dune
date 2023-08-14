@@ -1,6 +1,12 @@
 (executable
- (public_name sqltest2)
  (name main)
  (libraries sqltest2)
+ (modes js exe)
+ (preprocess (pps js_of_ocaml-ppx))
  (flags
   (:standard -w -66-69-37-34-32-33-9-27-26)))
+
+(menhir
+ (modules parser))
+
+(ocamllex lexer)
