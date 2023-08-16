@@ -539,32 +539,6 @@ and to_fqn (ast : Ast.select) =
   { Ast.columns; from; joins; group_by }
 
 let process_sql sql =
-  let sql = "
-SELECT
-  order_id,
-  order.customer_id,
-  customer.customer_id,
-  customer_name
-FROM
-  order
-LEFT OUTER JOIN
-  customer
-    ON order.customer_id = customer.customer_id
-GROUP BY customer_name" in
-  let sql = "
-SELECT
-  customer_id,
-  ct
-FROM (
-  SELECT
-    customer_id,
-    COUNT(order_id) AS ct
-  FROM
-    order
-  GROUP BY
-    customer_id
-) AS t
-  " in
   let lexbuf = Lexing.from_string sql in
   let ast = Parser.prog Lexer.read lexbuf in
   let ast = to_fqn ast in
@@ -574,11 +548,40 @@ FROM (
   let result = AstChecker.check_select ast schema in
   print_endline @@ "result table: " ^ Schema.show_schema { tables = [ result ] };
   Schema.show_schema { tables = [ result ] }
-  
-open Js_of_ocaml
+
+let () =
+  let sql = "
+    SELECT
+    order_id,
+    order.customer_id,
+    customer.customer_id,
+    customer_name
+    FROM
+    order
+    LEFT OUTER JOIN
+    customer
+      ON order.customer_id = customer.customer_id
+    GROUP BY customer_name" in
+  (* let sql = "
+    SELECT
+    customer_id,
+    ct
+    FROM (
+    SELECT
+      customer_id,
+      COUNT(order_id) AS ct
+    FROM
+      order
+    GROUP BY
+      customer_id
+    ) AS t
+  " in *)
+  ignore @@ process_sql sql
+
+(* open Js_of_ocaml
 
 let _ =
   Js.export "myLib"
     (object%js
         method process_sql sql = process_sql sql
-      end)
+      end) *)
